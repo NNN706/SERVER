@@ -1,119 +1,127 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ---------------- Configurable ----------------
-SEARCH_START="/"               # где начинать поиск wg0.conf
-SERVER_PORT_DEFAULT=43142
-CLIENT_SUBNET_BASE="10.8.1."
-# --------------------------------------------
+# ---------------------------
+# Полный скрипт: create client and append peer to wg0.conf
+# Исправлена проблема: извлечение PrivateKey сервера не обрезает завершающий '='
+# ---------------------------
 
-# 1) find wg0.conf
-WG_SERVER_CONF=$(find "$SEARCH_START" -type f -name wg0.conf 2>/dev/null | head -n 1 || true)
-if [[ -z "$WG_SERVER_CONF" ]]; then
-  echo "Ошибка: wg0.conf не найден"
+# Поиск wg0.conf (первый найденный)
+WG_SERVER_CONF=$(find / -type f -name wg0.conf 2>/dev/null | head -n 1 || true)
+
+if [[ -z "${WG_SERVER_CONF:-}" ]]; then
+  echo "Ошибка: wg0.conf не найден (искали по всему /)."
   exit 1
 fi
-WG_DIR=$(dirname "$WG_SERVER_CONF")
-WG_CLIENT_DIR="$WG_DIR"
-echo "Найден: $WG_SERVER_CONF"
-echo "Клиентские конфиги будут в: $WG_CLIENT_DIR"
 
-# 2) sanity: required programs
-for util in awk sed grep wg wg-quick curl; do
-  if ! command -v "$util" >/dev/null 2>&1; then
-    echo "Требуется утилита: $util"
+WG_DIR=$(dirname "$WG_SERVER_CONF")
+WG_CLIENT_DIR="$WG_DIR"   # сохранять клиентские конфиги в той же директории, где найден wg0.conf
+
+echo "Найден конфиг WireGuard: $WG_SERVER_CONF"
+echo "Клиентские конфиги будут сохраняться в: $WG_CLIENT_DIR"
+
+# Проверки наличия нужных утилит
+for cmd in wg wg-quick curl sed awk grep tr od; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "Ошибка: требуется утилита '$cmd' — установите соответствующий пакет."
     exit 1
   fi
 done
 
-# 3) backup original
-cp -a "$WG_SERVER_CONF" "${WG_SERVER_CONF}.bak.$(date +%s)"
+# Параметры
+WG_CLIENT_IP_BASE="10.8.1."
+SERVER_IP=$(curl -s https://ifconfig.me || true)
+if [[ -z "$SERVER_IP" ]]; then
+  SERVER_IP="your.server.ip"
+fi
+SERVER_PORT=43142
 
-# 4) extract & clean server private key
-SERVER_PRIV_RAW=$(awk -F'=' '/^[[:space:]]*PrivateKey[[:space:]]*=/ { val=$2; gsub(/^[ \t]+|[ \t]+$/,"",val); print val; exit }' "$WG_SERVER_CONF" || true)
-SERVER_PRIV=$(printf "%s" "$SERVER_PRIV_RAW" | tr -d '\r' | sed -E "s/^['\"]|['\"]$//g" | tr -d ' ')
-if [[ -z "$SERVER_PRIV" ]]; then
-  echo "Ошибка: не найден PrivateKey в $WG_SERVER_CONF"
+mkdir -p "$WG_CLIENT_DIR"
+
+# Номер следующего clientX
+next_client_number() {
+  local max=0 file num
+  for file in "$WG_CLIENT_DIR"/client*.conf; do
+    [ -e "$file" ] || continue
+    num=$(basename "$file" .conf | sed 's/^client//' || true)
+    if [[ "$num" =~ ^[0-9]+$ ]]; then
+      (( num > max )) && max=$num
+    fi
+  done
+  echo $((max + 1))
+}
+
+CLIENT_NUMBER=$(next_client_number)
+CLIENT_NAME="client${CLIENT_NUMBER}"
+
+# =========================
+# ВАЖНО: корректное извлечение PrivateKey СЕРВЕРА
+# Используем sed, чтобы удалить префикс "PrivateKey = " и сохранить всё остальное (включая trailing '=')
+# =========================
+SERVER_PRIV_KEY=$(sed -n 's/^[[:space:]]*PrivateKey[[:space:]]*=[[:space:]]*//p' "$WG_SERVER_CONF" | head -n 1 || true)
+# Удаляем CR и кавычки и лишние пробелы по краям, но НЕ удаляем trailing '='
+SERVER_PRIV_KEY=$(printf "%s" "$SERVER_PRIV_KEY" | tr -d '\r' | sed -E "s/^['\"]|['\"]$//g" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')
+
+if [[ -z "$SERVER_PRIV_KEY" ]]; then
+  echo "Ошибка: PrivateKey сервера не найден в $WG_SERVER_CONF"
   exit 1
 fi
-echo "PrivateKey length: ${#SERVER_PRIV}"
-if ! printf "%s" "$SERVER_PRIV" | grep -Eq '^[A-Za-z0-9+/]+=*$'; then
-  echo "Ошибка: приватный ключ содержит недопустимые символы"
+
+# Проверка базового формата
+if ! printf "%s" "$SERVER_PRIV_KEY" | grep -Eq '^[A-Za-z0-9+/]+=*$'; then
+  echo "Ошибка: извлечённая строка не похожа на base64 (недопустимые символы)."
+  echo "Masked: $(printf "%s" "$SERVER_PRIV_KEY" | sed -E 's/(.{4}).*(.{4})/\1... \2/')"
   exit 1
 fi
 
-# 5) try generate server public key
+echo "PrivateKey length: ${#SERVER_PRIV_KEY}"
+
+# Попытка сгенерировать публичный ключ сервера
 set +e
-SERVER_PUB=$(printf "%s" "$SERVER_PRIV" | wg pubkey 2>/tmp/wg_pub_err || true)
-RC=$?
+SERVER_PUB_KEY=$(printf "%s" "$SERVER_PRIV_KEY" | wg pubkey 2>/tmp/_wg_err.$$) || true
+WG_RC=$?
 set -e
-if [[ $RC -ne 0 || -z "$SERVER_PUB" ]]; then
-  echo "Ошибка: не удалось сгенерировать public key из private key (wg pubkey)."
-  echo "Содержимое /tmp/wg_pub_err:"
-  sed -n '1,200p' /tmp/wg_pub_err || true
-  rm -f /tmp/wg_pub_err
+
+if [[ $WG_RC -ne 0 || -z "${SERVER_PUB_KEY:-}" ]]; then
+  echo "Ошибка: не удалось сгенерировать public key из private key (wg pubkey вернул ошибку)."
+  echo "Проверяй корректность PrivateKey в $WG_SERVER_CONF"
+  echo "wg stderr:"
+  sed -n '1,200p' /tmp/_wg_err.$$ || true
+  rm -f /tmp/_wg_err.$$ || true
   exit 1
 fi
-rm -f /tmp/wg_pub_err
+rm -f /tmp/_wg_err.$$ || true
 echo "Server public key OK."
 
-# 6) check duplicates in AllowedIPs (detect same last octet)
-mapfile -t USED < <(sed -n 's/.*'"${CLIENT_SUBNET_BASE%?}"'\([0-9][0-9]*\).*/\1/p' "$WG_SERVER_CONF" | sort -n | uniq || true)
-if [[ ${#USED[@]} -ne 0 ]]; then
-  # find duplicates (same IP used >1)
-  dup_found=0
-  while read -r ip; do
-    count=$(grep -c "AllowedIPs = .*${CLIENT_SUBNET_BASE}${ip}" "$WG_SERVER_CONF" || true)
-    if (( count > 1 )); then
-      echo "ВНИМАНИЕ: IP ${CLIENT_SUBNET_BASE}${ip} встречается ${count} раз в AllowedIPs (конфликт)."
-      dup_found=1
-    fi
-  done < <(printf "%s\n" "${USED[@]}")
-  if (( dup_found )); then
-    echo "Исправьте конфликты AllowedIPs прежде чем добавлять нового клиента."
-    exit 1
-  fi
-fi
-
-# 7) decide new client number and IP
-mkdir -p "$WG_CLIENT_DIR"
-next_num=1
-for f in "$WG_CLIENT_DIR"/client*.conf; do
-  [ -e "$f" ] || continue
-  n=$(basename "$f" .conf | sed 's/^client//' || echo "")
-  if [[ "$n" =~ ^[0-9]+$ && $n -ge $next_num ]]; then
-    next_num=$((n+1))
-  fi
-done
-CLIENT_NAME="client${next_num}"
-
-# find last used octet and add one, start at 2
-last_octet=1
-if [[ -n "${USED[*]:-}" ]]; then
-  last_octet=$(printf "%s\n" "${USED[@]}" | tail -n1)
-fi
-next_octet=$((last_octet+1))
-if (( next_octet < 2 )); then next_octet=2; fi
-CLIENT_IP="${CLIENT_SUBNET_BASE}${next_octet}/32"
-
-# 8) generate client keys
-CLIENT_PRIV=$(wg genkey)
-CLIENT_PUB=$(printf "%s" "$CLIENT_PRIV" | wg pubkey)
+# =========================
+# Генерация ключей клиента
+# =========================
+CLIENT_PRIV_KEY=$(wg genkey)
+CLIENT_PUB_KEY=$(printf "%s" "$CLIENT_PRIV_KEY" | wg pubkey)
 CLIENT_PSK=$(wg genpsk)
 
-# 9) obtain server external ip if possible
-SERVER_IP=$(curl -s https://ifconfig.me || true)
-if [[ -z "$SERVER_IP" ]]; then SERVER_IP="your.server.ip"; fi
-SERVER_PORT=$SERVER_PORT_DEFAULT
+# =========================
+# Определение следующего IP в подсети (ищем Used AllowedIPs в server conf)
+# =========================
+USED_LAST_OCTETS=$(sed -n 's/.*10\.8\.1\.\([0-9][0-9]*\).*/\1/p' "$WG_SERVER_CONF" | sort -n || true)
+NEXT_OCTET=2
+if [[ -n "$USED_LAST_OCTETS" ]]; then
+  LAST=$(printf "%s\n" "$USED_LAST_OCTETS" | tail -n 1)
+  NEXT_OCTET=$((LAST + 1))
+  if (( NEXT_OCTET < 2 )); then NEXT_OCTET=2; fi
+fi
 
-CLIENT_CONF_PATH="$WG_CLIENT_DIR/${CLIENT_NAME}.conf"
+CLIENT_IP="${WG_CLIENT_IP_BASE}${NEXT_OCTET}/32"
+CLIENT_CONF="$WG_CLIENT_DIR/${CLIENT_NAME}.conf"
 
-# 10) write client conf
-cat > "$CLIENT_CONF_PATH" <<EOF
+# =========================
+# Запись клиентского конфига (гарантированно пишем PrivateKey клиента)
+# =========================
+cat > "$CLIENT_CONF" <<EOF
 [Interface]
 Address = $CLIENT_IP
 DNS = 1.1.1.1, 1.0.0.1
-PrivateKey = $CLIENT_PRIV
+PrivateKey = $CLIENT_PRIV_KEY
 Jc = 4
 Jmin = 8
 Jmax = 80
@@ -125,44 +133,54 @@ H3 = 3
 H4 = 4
 
 [Peer]
-PublicKey = $SERVER_PUB
+PublicKey = $SERVER_PUB_KEY
 PresharedKey = $CLIENT_PSK
 AllowedIPs = 0.0.0.0/0, ::/0
 Endpoint = $SERVER_IP:$SERVER_PORT
 PersistentKeepalive = 25
 EOF
 
-echo "Создан клиентский файл: $CLIENT_CONF_PATH"
+echo "Клиентский конфиг создан: $CLIENT_CONF"
 
-# 11) append to server wg0.conf
+# =========================
+# Добавляем пира в серверный конфиг
+# =========================
+cp "$WG_SERVER_CONF" "${WG_SERVER_CONF}.bak.$(date +%s)"
 {
   printf "\n[Peer]\n"
-  printf "PublicKey = %s\n" "$CLIENT_PUB"
+  printf "PublicKey = %s\n" "$CLIENT_PUB_KEY"
   printf "PresharedKey = %s\n" "$CLIENT_PSK"
   printf "AllowedIPs = %s\n" "$CLIENT_IP"
 } >> "$WG_SERVER_CONF"
 
-echo "Пир добавлен в $WG_SERVER_CONF"
+echo "Пир добавлен в серверный конфиг $WG_SERVER_CONF с IP $CLIENT_IP (бэкап сохранён)."
 
-# 12) try wg-quick down/up with full path, else by iface name
+# =========================
+# Перезапуск wg-quick с полным путём
+# =========================
 set +e
-wg-quick down "$WG_SERVER_CONF" 2>/dev/null
+wg-quick down "$WG_SERVER_CONF" 2>/dev/null || true
 wg-quick up "$WG_SERVER_CONF"
-rc=$?
+RC=$?
 set -e
-if [[ $rc -ne 0 ]]; then
+
+if [[ $RC -ne 0 ]]; then
   IFACE=$(basename "$WG_SERVER_CONF" .conf)
-  echo "wg-quick up по полному пути вернул код $rc, пробуем wg-quick up $IFACE"
+  echo "wg-quick up вернул код $RC; пробуем wg-quick up $IFACE"
   set +e
   wg-quick down "$IFACE" 2>/dev/null || true
   wg-quick up "$IFACE"
-  rc2=$?
+  RC2=$?
   set -e
-  if [[ $rc2 -ne 0 ]]; then
-    echo "Не удалось поднять интерфейс: попробуйте вручную: wg-quick up \"$WG_SERVER_CONF\" или wg-quick up $IFACE"
+  if [[ $RC2 -ne 0 ]]; then
+    echo "Ошибка при запуске интерфейса. Проверьте логи и права."
     exit 1
   fi
 fi
 
-echo "Готово. Клиент: $CLIENT_NAME, файл: $CLIENT_CONF_PATH, IP: $CLIENT_IP"
+echo "WireGuard перезапущен успешно."
+echo "Новый клиент: $CLIENT_NAME"
+echo "Клиентский файл: $CLIENT_CONF"
+echo "IP клиента: $CLIENT_IP"
+
 exit 0
