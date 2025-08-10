@@ -1,12 +1,21 @@
 #!/bin/bash
 
-WG_SERVER_CONF="/etc/wireguard/wg0.conf"
-WG_CLIENT_DIR="$HOME/wireguard_clients"
+# Ищем wg0.conf во всей системе
+WG_SERVER_CONF=$(find / -type f -name "wg0.conf" 2>/dev/null | head -n 1)
+
+if [ -z "$WG_SERVER_CONF" ]; then
+  echo "Ошибка: файл wg0.conf не найден."
+  exit 1
+fi
+
+echo "Найден конфиг WireGuard: $WG_SERVER_CONF"
+
+WG_CLIENT_DIR="."
 WG_CLIENT_IP_BASE="10.8.1."
 
 mkdir -p "$WG_CLIENT_DIR"
 
-# Получаем внешний IP сервера автоматически
+# Получаем внешний IP сервера
 SERVER_IP=$(curl -s https://ifconfig.me)
 SERVER_PORT=43142
 
@@ -29,7 +38,7 @@ CLIENT_PRIV_KEY=$(wg genkey)
 CLIENT_PUB_KEY=$(echo "$CLIENT_PRIV_KEY" | wg pubkey)
 CLIENT_PSK=$(wg genpsk)
 
-USED_IPS=$(grep AllowedIPs "$WG_SERVER_CONF" | grep -oP '10\.8\.1\.\d+' | sort -t . -k 4 -n)
+USED_IPS=$(grep AllowedIPs "$WG_SERVER_CONF" | grep -oE '10\.8\.1\.[0-9]+' | sort -t . -k 4 -n)
 LAST_IP=2
 if [ -n "$USED_IPS" ]; then
   LAST_IP=$(echo "$USED_IPS" | tail -1 | awk -F. '{print $4}')
@@ -56,7 +65,7 @@ H3 = 3
 H4 = 4
 
 [Peer]
-PublicKey = $(grep '^PrivateKey' $WG_SERVER_CONF -A2 | grep PublicKey | awk '{print $3}')
+PublicKey = $(grep -A2 '\[Interface\]' "$WG_SERVER_CONF" | grep PublicKey | awk '{print $3}')
 PresharedKey = $CLIENT_PSK
 AllowedIPs = 0.0.0.0/0, ::/0
 Endpoint = $SERVER_IP:$SERVER_PORT
