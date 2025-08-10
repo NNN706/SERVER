@@ -10,7 +10,12 @@ fi
 
 echo "Найден конфиг WireGuard: $WG_SERVER_CONF"
 
-WG_CLIENT_DIR="."
+# Директория, где находится wg0.conf
+WG_CONF_DIR=$(dirname "$WG_SERVER_CONF")
+
+# Сохраняем клиентские конфиги в эту же директорию
+WG_CLIENT_DIR="$WG_CONF_DIR"
+
 WG_CLIENT_IP_BASE="10.8.1."
 
 mkdir -p "$WG_CLIENT_DIR"
