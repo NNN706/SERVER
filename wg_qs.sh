@@ -89,8 +89,8 @@ EOF
 
 echo "Пир добавлен в серверный конфиг $WG_SERVER_CONF с IP $CLIENT_IP"
 
-wg-quick down wg0
-wg-quick up wg0
+wg-quick down "$WG_SERVER_CONF"
+wg-quick up "$WG_SERVER_CONF"
 
 echo "WireGuard сервер перезапущен."
 echo "Новый клиент: $CLIENT_NAME с IP $CLIENT_IP"
