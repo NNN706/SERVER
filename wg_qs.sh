@@ -1,29 +1,24 @@
 #!/bin/bash
 
-# Ищем wg0.conf во всей системе
-WG_SERVER_CONF=$(find / -type f -name "wg0.conf" 2>/dev/null | head -n 1)
+# Ищем серверный конфиг wg0.conf во всей файловой системе, кроме некоторых системных путей
+WG_SERVER_CONF=$(find / -type f -name wg0.conf 2>/dev/null | grep -vE '^/(proc|sys|dev|run|var/lib|var/run)' | head -n1)
 
-if [ -z "$WG_SERVER_CONF" ]; then
-  echo "Ошибка: файл wg0.conf не найден."
+if [[ -z "$WG_SERVER_CONF" ]]; then
+  echo "Ошибка: не найден файл wg0.conf"
   exit 1
 fi
 
-echo "Найден конфиг WireGuard: $WG_SERVER_CONF"
-
-# Директория, где находится wg0.conf
-WG_CONF_DIR=$(dirname "$WG_SERVER_CONF")
-
-# Сохраняем клиентские конфиги в эту же директорию
-WG_CLIENT_DIR="$WG_CONF_DIR"
+# Папка для клиентских конфигов - в той же директории, где найден серверный конфиг
+WG_CLIENT_DIR="$(dirname "$WG_SERVER_CONF")/wireguard_clients"
+mkdir -p "$WG_CLIENT_DIR"
 
 WG_CLIENT_IP_BASE="10.8.1."
 
-mkdir -p "$WG_CLIENT_DIR"
-
-# Получаем внешний IP сервера
+# Получаем IP сервера автоматически
 SERVER_IP=$(curl -s https://ifconfig.me)
 SERVER_PORT=43142
 
+# Функция для поиска следующего номера клиента
 next_client_number() {
   max=0
   for file in "$WG_CLIENT_DIR"/client*.conf; do
@@ -39,12 +34,24 @@ next_client_number() {
 CLIENT_NUMBER=$(next_client_number)
 CLIENT_NAME="client${CLIENT_NUMBER}"
 
+# Читаем приватный ключ сервера из конфигурации
+SERVER_PRIV_KEY=$(grep '^PrivateKey' "$WG_SERVER_CONF" | awk '{print $3}')
+if [[ -z "$SERVER_PRIV_KEY" ]]; then
+  echo "Ошибка: не найден PrivateKey в $WG_SERVER_CONF"
+  exit 1
+fi
+
+# Генерируем публичный ключ сервера из приватного
+SERVER_PUB_KEY=$(echo "$SERVER_PRIV_KEY" | wg pubkey)
+
+# Генерируем ключи клиента
 CLIENT_PRIV_KEY=$(wg genkey)
 CLIENT_PUB_KEY=$(echo "$CLIENT_PRIV_KEY" | wg pubkey)
 CLIENT_PSK=$(wg genpsk)
 
-USED_IPS=$(grep AllowedIPs "$WG_SERVER_CONF" | grep -oE '10\.8\.1\.[0-9]+' | sort -t . -k 4 -n)
-LAST_IP=2
+# Определяем IP для клиента
+USED_IPS=$(grep AllowedIPs "$WG_SERVER_CONF" | grep -oP '10\.8\.1\.\d+' | sort -t . -k 4 -n)
+LAST_IP=1
 if [ -n "$USED_IPS" ]; then
   LAST_IP=$(echo "$USED_IPS" | tail -1 | awk -F. '{print $4}')
   LAST_IP=$((LAST_IP + 1))
@@ -54,6 +61,7 @@ CLIENT_IP="${WG_CLIENT_IP_BASE}${LAST_IP}/32"
 
 CLIENT_CONF="$WG_CLIENT_DIR/${CLIENT_NAME}.conf"
 
+# Создаём клиентский конфиг
 cat > "$CLIENT_CONF" << EOF
 [Interface]
 Address = $CLIENT_IP
@@ -70,7 +78,7 @@ H3 = 3
 H4 = 4
 
 [Peer]
-PublicKey = $(grep -A2 '\[Interface\]' "$WG_SERVER_CONF" | grep PublicKey | awk '{print $3}')
+PublicKey = $SERVER_PUB_KEY
 PresharedKey = $CLIENT_PSK
 AllowedIPs = 0.0.0.0/0, ::/0
 Endpoint = $SERVER_IP:$SERVER_PORT
@@ -79,6 +87,7 @@ EOF
 
 echo "Клиентский конфиг создан: $CLIENT_CONF"
 
+# Добавляем клиента в серверный конфиг
 cat >> "$WG_SERVER_CONF" << EOF
 
 [Peer]
@@ -89,8 +98,9 @@ EOF
 
 echo "Пир добавлен в серверный конфиг $WG_SERVER_CONF с IP $CLIENT_IP"
 
-wg-quick down "$WG_SERVER_CONF"
-wg-quick up "$WG_SERVER_CONF"
+# Перезапускаем WireGuard (без sudo)
+wg-quick down wg0
+wg-quick up wg0
 
 echo "WireGuard сервер перезапущен."
 echo "Новый клиент: $CLIENT_NAME с IP $CLIENT_IP"
